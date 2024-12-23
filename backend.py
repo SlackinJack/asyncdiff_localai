@@ -20,7 +20,12 @@ from PIL import Image
 
 _ONE_DAY_IN_SECONDS = 60 * 60 * 24
 COMPEL = os.environ.get("COMPEL", "0") == "1"
-WARMUP_STEPS = 0
+CHUNK_SIZE = os.environ.get("CHUNK_SIZE", 8)
+MOTION_BUCKET_ID = os.environ.get("MOTION_BUCKET_ID", 180)
+NOISE_AUG_STRENGTH = os.environ.get("NOISE_AUG_STRENGTH", 0.01)
+FRAMES = os.environ.get("FRAMES", 25)
+TIME_SHIFT = os.environ.get("TIME_SHIFT", "0") == "1"
+# WARMUP_STEPS = 0
 HOST_INIT_TIMEOUT = 600
 
 
@@ -46,6 +51,8 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
     last_model_path = None
     last_cfg_scale = 7
     # last_scheduler = None
+    variant = "fp32"
+    is_low_vram = False
 
     is_loaded = False
     needs_reload = False
@@ -73,9 +80,20 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             if os.path.exists(request.ModelFile):
                 self.last_model_path = request.ModelFile
 
+        if request.F16Memory and self.variant != "fp16":
+            self.needs_reload = True
+            self.variant = "fp16"
+        elif not request.F16Memory and self.variant != "fp32":
+            self.needs_reload = True
+            self.variant = "fp32"
+
         # if request.SchedulerType != self.last_scheduler:
         #     self.needs_reload = True
         #     self.last_scheduler = request.SchedulerType
+
+        if self.is_low_vram != request.LowVRAM:
+            # self.needs_reload = True
+            self.is_low_vram = request.LowVRAM
 
         return backend_pb2.Result(message="", success=True)
 
@@ -89,6 +107,11 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             nproc_per_node = torch.cuda.device_count()
             self.last_height = request.height
             self.last_width = request.width
+
+            # ensure the following is true:
+            # (model_n + stride - 1 ) <= nproc_per_node
+            model_n = nproc_per_node
+            stride = 1
 
             # scheduler = self.last_scheduler
             # if scheduler is None or len(scheduler) == 0:
@@ -109,6 +132,10 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
 
                 f'--model={self.last_model_path}',
                 f'--pipeline_type={pipeline_type}',
+                f'--model_n={model_n}',
+                f'--stride={stride}',
+                f'--time_shift={TIME_SHIFT}',
+                f'--variant={self.variant}',
                 # f'--scheduler={scheduler}',
             ]
 
@@ -133,6 +160,10 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                     return backend_pb2.Result(message=f"Failed to launch host within {HOST_INIT_TIMEOUT} seconds", success=False)
 
         if self.is_loaded:
+            decode_chunk_size = CHUNK_SIZE
+            if self.is_low_vram:
+                decode_chunk_size = 2
+
             url = 'http://localhost:6000/generate'
             data = {
                 "image": request.src,
@@ -140,8 +171,10 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                 "height": request.height,
                 "num_inference_steps": request.step,
                 "seed": request.seed,
-                "decode_chunk_size": 2, #8 default, lower to use less vram
-                "num_frames": 25, #25 default
+                "decode_chunk_size": decode_chunk_size,
+                "num_frames": FRAMES,
+                "motion_bucket_id": MOTION_BUCKET_ID,
+                "noise_aug_strength": NOISE_AUG_STRENGTH,
                 "output_path": request.dst,
             }
 
@@ -150,7 +183,7 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             output_path = response_data.get("output_path", "")
 
             if os.path.isfile(output_path):
-                # TODO: get gif or mp4 or both
+                # TODO: get gif or mp4 or both, fix file extension
                 return backend_pb2.Result(message="Media generated", success=True)
             return backend_pb2.Result(message="No media generated", success=False)
         else:
