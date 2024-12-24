@@ -17,8 +17,8 @@ from compel import Compel, ReturnedEmbeddingsType
 from flask import Flask, request, jsonify
 from PIL import Image
 
-from diffusers import StableVideoDiffusionPipeline
 from AsyncDiff.asyncdiff.async_sd import AsyncDiff
+from diffusers import StableVideoDiffusionPipeline
 from diffusers.utils import load_image, export_to_video, export_to_gif
 
 # from diffusers.schedulers import (
@@ -89,12 +89,12 @@ def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default=None)   
     parser.add_argument("--seed", type=int, default=20)
-    parser.add_argument("--model_n", type=int, default=2)
-    parser.add_argument("--stride", type=int, default=1)
+    parser.add_argument("--model_n", type=int, default=2, choices=[2, 3, 4])
+    parser.add_argument("--stride", type=int, default=1, choices=[1, 2])
     parser.add_argument("--warm_up", type=int, default=1)
     parser.add_argument("--time_shift", type=bool, default=False)
     # added args
-    parser.add_argument("--pipeline_type", type=str, default=None, choices=["epic", "sd1", "sd2", "sd3", "sdup", "sdxl", "svd"])
+    parser.add_argument("--pipeline_type", type=str, default=None, choices=["ad", "sd1", "sd2", "sd3", "sdup", "sdxl", "svd"])
     parser.add_argument("--variant", type=str, default="fp16", help="PyTorch variant [fp16/fp32]")
     # parser.add_argument("--scheduler", type=str, default="ddim")
     args = parser.parse_args()
@@ -140,13 +140,23 @@ def initialize():
     file_name = "rocket"
     image = image.resize((512, 288))
 
-    pipe = StableVideoDiffusionPipeline.from_pretrained(
-        args.model,
-        torch_dtype=torch.float16 if args.variant == "fp16" else torch.float32,
-    )
+    match args.pipeline_type:
+        case "svd":
+            pipe = StableVideoDiffusionPipeline.from_pretrained(
+                args.model,
+                torch_dtype=torch.float16 if args.variant == "fp16" else torch.float32,
+            )
+        case _: raise NotImplementedError
+
     # pipe.scheduler = get_scheduler(args.scheduler, pipe.scheduler.config)
 
-    async_diff = AsyncDiff(pipe, args.pipeline_type, model_n=args.model_n, stride=args.stride, time_shift=args.time_shift)
+    async_diff = AsyncDiff(
+        pipe,
+        args.pipeline_type,
+        model_n=args.model_n,
+        stride=args.stride,
+        time_shift=args.time_shift,
+    )
 
     pipe.set_progress_bar_config(disable=dist.get_rank() != 0)
     # low vram test
@@ -154,16 +164,19 @@ def initialize():
     # pipe.unet.enable_forward_chunking()
 
     # warm up
+    logger.info("Starting warmup run")
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     async_diff.reset_state(warm_up=args.warm_up)
-    pipe(
-        image, 
-        decode_chunk_size=1,
-        num_inference_steps=2,
-        width=320,
-        height=320,
-    )
+    match args.pipeline_type:
+        case _:
+            pipe(
+                image,
+                decode_chunk_size=1,
+                num_inference_steps=2,
+                width=320,
+                height=320,
+            )
 
     torch.cuda.empty_cache()
 
@@ -186,17 +199,19 @@ def generate_image_parallel(
     async_diff.reset_state(warm_up=args.warm_up)
 
     image = load_image(image)
-    frames = pipe(
-        image,
-        width=width,
-        height=height,
-        num_inference_steps=num_inference_steps,
-        num_frames=num_frames,
-        decode_chunk_size=decode_chunk_size,
-        motion_bucket_id=motion_bucket_id,
-        noise_aug_strength=noise_aug_strength,
-        output_type="pil",
-    ).frames[0]
+    match args.pipeline_type:
+        case _:
+            frames = pipe(
+                image,
+                width=width,
+                height=height,
+                num_inference_steps=num_inference_steps,
+                num_frames=num_frames,
+                decode_chunk_size=decode_chunk_size,
+                motion_bucket_id=motion_bucket_id,
+                noise_aug_strength=noise_aug_strength,
+                output_type="pil",
+            ).frames[0]
     end_time = time.time()
     elapsed_time = end_time - start_time
 
