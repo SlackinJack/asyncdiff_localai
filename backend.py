@@ -20,11 +20,12 @@ from PIL import Image
 
 _ONE_DAY_IN_SECONDS = 60 * 60 * 24
 COMPEL = os.environ.get("COMPEL", "0") == "1"
-CHUNK_SIZE = os.environ.get("CHUNK_SIZE", 8)
-MOTION_BUCKET_ID = os.environ.get("MOTION_BUCKET_ID", 180)
-NOISE_AUG_STRENGTH = os.environ.get("NOISE_AUG_STRENGTH", 0.01)
-FRAMES = os.environ.get("FRAMES", 25)
+CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", 8))
+MOTION_BUCKET_ID = int(os.environ.get("MOTION_BUCKET_ID", 180))
+NOISE_AUG_STRENGTH = float(os.environ.get("NOISE_AUG_STRENGTH", 0.01))
+FRAMES = int(os.environ.get("FRAMES", 25))
 TIME_SHIFT = os.environ.get("TIME_SHIFT", "0") == "1"
+SCALE_PERCENTAGE=int(os.environ.get("SCALE_PERCENTAGE", 80))
 # WARMUP_STEPS = 0
 HOST_INIT_TIMEOUT = 600
 
@@ -92,7 +93,7 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
         #     self.last_scheduler = request.SchedulerType
 
         if self.is_low_vram != request.LowVRAM:
-            # self.needs_reload = True
+            self.needs_reload = True
             self.is_low_vram = request.LowVRAM
 
         return backend_pb2.Result(message="", success=True)
@@ -119,7 +120,9 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
 
             pipeline_type = None
             model_name = self.last_model_path.lower()
-            if "stable-video-diffusion-img2vid" in model_name:
+            if "stable-diffusion-x4-upscaler" in model_name:
+                pipeline_type = "sdup"
+            elif "stable-video-diffusion-img2vid" in model_name:
                 pipeline_type = "svd"
             else:
                 kill_process()
@@ -130,6 +133,7 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                 f'--nproc_per_node={nproc_per_node}',
                 'host.py',
 
+                f'--host_mode=localai',
                 f'--model={self.last_model_path}',
                 f'--pipeline_type={pipeline_type}',
                 f'--model_n={model_n}',
@@ -138,6 +142,15 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                 f'--variant={self.variant}',
                 # f'--scheduler={scheduler}',
             ]
+
+            if self.is_low_vram:
+                # cmd.append('--enable_model_cpu_offload')          # breaks parallelism
+                # cmd.append('--enable_sequential_cpu_offload')     # crash
+                cmd.append('--enable_tiling')
+                cmd.append('--enable_slicing')
+                cmd.append('--xformers_efficient')
+                cmd.append('--scale_input')
+                cmd.append(f'--scale_percentage={SCALE_PERCENTAGE}')
 
             cmd = [arg for arg in cmd if arg]
             global process
@@ -160,9 +173,10 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                     return backend_pb2.Result(message=f"Failed to launch host within {HOST_INIT_TIMEOUT} seconds", success=False)
 
         if self.is_loaded:
-            decode_chunk_size = CHUNK_SIZE
-            if self.is_low_vram:
+            if self.is_low_vram and CHUNK_SIZE >= 2:
                 decode_chunk_size = 2
+            else:
+                decode_chunk_size = CHUNK_SIZE
 
             url = 'http://localhost:6000/generate'
             data = {
@@ -177,6 +191,12 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                 "noise_aug_strength": NOISE_AUG_STRENGTH,
                 "output_path": request.dst,
             }
+
+            if request.positive_prompt and len(request.positive_prompt) > 0:
+                data["positive_prompt"] = request.positive_prompt
+
+            if request.negative_prompt and len(request.negative_prompt) > 0:
+                data["negative_prompt"] = request.negative_prompt
 
             response = requests.post(url, json=data)
             response_data = response.json()
